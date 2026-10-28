@@ -1,0 +1,1100 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  ScaleLab - highly available EC2 web application with an ALB, Auto Scaling,
+  Amazon RDS Multi-AZ, AWS WAF, CloudFront static asset delivery, and private
+  administration through AWS Systems Manager Session Manager.
+
+Parameters:
+  AppName:
+    Type: String
+    Default: scalelab
+    AllowedPattern: '^[a-z][a-z0-9-]{2,19}$'
+    Description: Prefix used for resource names and database identifiers.
+  AppInstanceType:
+    Type: String
+    Default: t3.micro
+    Description: EC2 type for the web Auto Scaling group.
+  DatabaseInstanceClass:
+    Type: String
+    Default: db.t3.micro
+    Description: RDS class. Select a class supported by the deployment Region.
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: Latest Amazon Linux 2023 x86_64 AMI public parameter.
+  DomainName:
+    Type: String
+    Default: ''
+    Description: Optional app hostname, for example app.example.com.
+  HostedZoneId:
+    Type: String
+    Default: ''
+    Description: Required when DomainName is set; Route 53 hosted zone ID.
+  CertificateArn:
+    Type: String
+    Default: ''
+    Description: Optional ACM certificate ARN in this Region for HTTPS on the ALB.
+  MinCapacity:
+    Type: Number
+    Default: 2
+    MinValue: 2
+    MaxValue: 10
+  DesiredCapacity:
+    Type: Number
+    Default: 2
+    MinValue: 2
+    MaxValue: 10
+  MaxCapacity:
+    Type: Number
+    Default: 6
+    MinValue: 2
+    MaxValue: 20
+
+Conditions:
+  HasDomain: !Not [!Equals [!Ref DomainName, '']]
+  HasCertificate: !Not [!Equals [!Ref CertificateArn, '']]
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.20.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AppName}-vpc'
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${AppName}-igw'
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: 10.20.1.0/24
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${AppName}-public-a'
+        - Key: Tier
+          Value: public
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: 10.20.2.0/24
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${AppName}-public-b'
+        - Key: Tier
+          Value: public
+  AppSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: 10.20.11.0/24
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${AppName}-app-a'
+        - Key: Tier
+          Value: app-private
+  AppSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: 10.20.12.0/24
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${AppName}-app-b'
+        - Key: Tier
+          Value: app-private
+  DatabaseSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: 10.20.21.0/24
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${AppName}-database-a'
+        - Key: Tier
+          Value: database-private
+  DatabaseSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: 10.20.22.0/24
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${AppName}-database-b'
+        - Key: Tier
+          Value: database-private
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AppName}-public-rt'
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  PublicRouteAssociationA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+  PublicRouteAssociationB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  NatEipA:
+    Type: AWS::EC2::EIP
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${AppName}-nat-eip-a'
+  NatEipB:
+    Type: AWS::EC2::EIP
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${AppName}-nat-eip-b'
+  NatGatewayA:
+    Type: AWS::EC2::NatGateway
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      AllocationId: !GetAtt NatEipA.AllocationId
+      SubnetId: !Ref PublicSubnetA
+      ConnectivityType: public
+      Tags:
+        - Key: Name
+          Value: !Sub '${AppName}-nat-a'
+  NatGatewayB:
+    Type: AWS::EC2::NatGateway
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      AllocationId: !GetAtt NatEipB.AllocationId
+      SubnetId: !Ref PublicSubnetB
+      ConnectivityType: public
+      Tags:
+        - Key: Name
+          Value: !Sub '${AppName}-nat-b'
+
+  AppRouteTableA:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AppName}-app-a-rt'
+  AppRouteTableB:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AppName}-app-b-rt'
+  AppDefaultRouteA:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref AppRouteTableA
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGatewayA
+  AppDefaultRouteB:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref AppRouteTableB
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGatewayB
+  AppRouteAssociationA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref AppSubnetA
+      RouteTableId: !Ref AppRouteTableA
+  AppRouteAssociationB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref AppSubnetB
+      RouteTableId: !Ref AppRouteTableB
+
+  DatabaseRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AppName}-database-isolated-rt'
+  DatabaseRouteAssociationA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref DatabaseSubnetA
+      RouteTableId: !Ref DatabaseRouteTable
+  DatabaseRouteAssociationB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref DatabaseSubnetB
+      RouteTableId: !Ref DatabaseRouteTable
+
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcEndpointType: Gateway
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      RouteTableIds:
+        - !Ref AppRouteTableA
+        - !Ref AppRouteTableB
+
+  PublicNACL:
+    Type: AWS::EC2::NetworkAcl
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AppName}-public-nacl'
+  PublicNACLInHttp:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref PublicNACL
+      RuleNumber: 100
+      Protocol: '6'
+      RuleAction: allow
+      Egress: false
+      CidrBlock: 0.0.0.0/0
+      PortRange: {From: 80, To: 80}
+  PublicNACLInHttps:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref PublicNACL
+      RuleNumber: 110
+      Protocol: '6'
+      RuleAction: allow
+      Egress: false
+      CidrBlock: 0.0.0.0/0
+      PortRange: {From: 443, To: 443}
+  PublicNACLInFromAppHttps:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref PublicNACL
+      RuleNumber: 120
+      Protocol: '6'
+      RuleAction: allow
+      Egress: false
+      CidrBlock: 10.20.0.0/16
+      PortRange: {From: 443, To: 443}
+  PublicNACLInEphemeral:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref PublicNACL
+      RuleNumber: 130
+      Protocol: '6'
+      RuleAction: allow
+      Egress: false
+      CidrBlock: 0.0.0.0/0
+      PortRange: {From: 1024, To: 65535}
+  PublicNACLOutToApp:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref PublicNACL
+      RuleNumber: 100
+      Protocol: '6'
+      RuleAction: allow
+      Egress: true
+      CidrBlock: 10.20.11.0/24
+      PortRange: {From: 8080, To: 8080}
+  PublicNACLOutToAppB:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref PublicNACL
+      RuleNumber: 110
+      Protocol: '6'
+      RuleAction: allow
+      Egress: true
+      CidrBlock: 10.20.12.0/24
+      PortRange: {From: 8080, To: 8080}
+  PublicNACLOutEphemeral:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref PublicNACL
+      RuleNumber: 120
+      Protocol: '6'
+      RuleAction: allow
+      Egress: true
+      CidrBlock: 0.0.0.0/0
+      PortRange: {From: 1024, To: 65535}
+  PublicNACLAssociationA:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      NetworkAclId: !Ref PublicNACL
+  PublicNACLAssociationB:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      NetworkAclId: !Ref PublicNACL
+
+  AppNACL:
+    Type: AWS::EC2::NetworkAcl
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AppName}-app-nacl'
+  AppNACLInFromAlbA:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref AppNACL
+      RuleNumber: 100
+      Protocol: '6'
+      RuleAction: allow
+      Egress: false
+      CidrBlock: 10.20.1.0/24
+      PortRange: {From: 8080, To: 8080}
+  AppNACLInFromAlbB:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref AppNACL
+      RuleNumber: 110
+      Protocol: '6'
+      RuleAction: allow
+      Egress: false
+      CidrBlock: 10.20.2.0/24
+      PortRange: {From: 8080, To: 8080}
+  AppNACLInEphemeral:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref AppNACL
+      RuleNumber: 120
+      Protocol: '6'
+      RuleAction: allow
+      Egress: false
+      CidrBlock: 0.0.0.0/0
+      PortRange: {From: 1024, To: 65535}
+  AppNACLOutToDatabaseA:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref AppNACL
+      RuleNumber: 100
+      Protocol: '6'
+      RuleAction: allow
+      Egress: true
+      CidrBlock: 10.20.21.0/24
+      PortRange: {From: 3306, To: 3306}
+  AppNACLOutToDatabaseB:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref AppNACL
+      RuleNumber: 110
+      Protocol: '6'
+      RuleAction: allow
+      Egress: true
+      CidrBlock: 10.20.22.0/24
+      PortRange: {From: 3306, To: 3306}
+  AppNACLOutHttps:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref AppNACL
+      RuleNumber: 120
+      Protocol: '6'
+      RuleAction: allow
+      Egress: true
+      CidrBlock: 0.0.0.0/0
+      PortRange: {From: 443, To: 443}
+  AppNACLOutEphemeral:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref AppNACL
+      RuleNumber: 130
+      Protocol: '6'
+      RuleAction: allow
+      Egress: true
+      CidrBlock: 0.0.0.0/0
+      PortRange: {From: 1024, To: 65535}
+  AppNACLAssociationA:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId: !Ref AppSubnetA
+      NetworkAclId: !Ref AppNACL
+  AppNACLAssociationB:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId: !Ref AppSubnetB
+      NetworkAclId: !Ref AppNACL
+
+  DatabaseNACL:
+    Type: AWS::EC2::NetworkAcl
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AppName}-database-nacl'
+  DatabaseNACLInFromAppA:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref DatabaseNACL
+      RuleNumber: 100
+      Protocol: 6
+      RuleAction: allow
+      Egress: false
+      CidrBlock: 10.20.11.0/24
+      PortRange: {From: 3306, To: 3306}
+  DatabaseNACLInFromAppB:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref DatabaseNACL
+      RuleNumber: 110
+      Protocol: 6
+      RuleAction: allow
+      Egress: false
+      CidrBlock: 10.20.12.0/24
+      PortRange: {From: 3306, To: 3306}
+  DatabaseNACLOutToAppA:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref DatabaseNACL
+      RuleNumber: 100
+      Protocol: 6
+      RuleAction: allow
+      Egress: true
+      CidrBlock: 10.20.11.0/24
+      PortRange: {From: 1024, To: 65535}
+  DatabaseNACLOutToAppB:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref DatabaseNACL
+      RuleNumber: 110
+      Protocol: 6
+      RuleAction: allow
+      Egress: true
+      CidrBlock: 10.20.12.0/24
+      PortRange: {From: 1024, To: 65535}
+  DatabaseNACLAssociationA:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId: !Ref DatabaseSubnetA
+      NetworkAclId: !Ref DatabaseNACL
+  DatabaseNACLAssociationB:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId: !Ref DatabaseSubnetB
+      NetworkAclId: !Ref DatabaseNACL
+
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Public HTTP/HTTPS ingress for the application load balancer.
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          DestinationSecurityGroupId: !GetAtt AppSecurityGroup.GroupId
+      Tags:
+        - Key: Name
+          Value: !Sub '${AppName}-alb-sg'
+  LoadBalancerHttpsIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasCertificate
+    Properties:
+      GroupId: !GetAtt LoadBalancerSecurityGroup.GroupId
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      CidrIp: 0.0.0.0/0
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Application traffic only from the ALB security group.
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub '${AppName}-app-sg'
+  AppIngressFromLoadBalancer:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !GetAtt AppSecurityGroup.GroupId
+      IpProtocol: tcp
+      FromPort: 8080
+      ToPort: 8080
+      SourceSecurityGroupId: !GetAtt LoadBalancerSecurityGroup.GroupId
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: MySQL is reachable only from application instances.
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !GetAtt AppSecurityGroup.GroupId
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub '${AppName}-database-sg'
+
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${AppName}-alb'
+      Scheme: internet-facing
+      Type: application
+      IpAddressType: ipv4
+      Subnets:
+        - !Ref PublicSubnetA
+        - !Ref PublicSubnetB
+      SecurityGroups:
+        - !GetAtt LoadBalancerSecurityGroup.GroupId
+      LoadBalancerAttributes:
+        - Key: deletion_protection.enabled
+          Value: 'false'
+        - Key: routing.http2.enabled
+          Value: 'true'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AppName}-alb'
+  ApplicationTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${AppName}-targets'
+      VpcId: !Ref VPC
+      Port: 8080
+      Protocol: HTTP
+      TargetType: instance
+      HealthCheckEnabled: true
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /healthz
+      HealthCheckIntervalSeconds: 20
+      HealthyThresholdCount: 3
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: '200'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AppName}-targets'
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - !If
+          - HasCertificate
+          - Type: redirect
+            RedirectConfig:
+              Protocol: HTTPS
+              Port: '443'
+              StatusCode: HTTP_301
+          - Type: forward
+            TargetGroupArn: !Ref ApplicationTargetGroup
+  HttpsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: HasCertificate
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref CertificateArn
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ApplicationTargetGroup
+
+  ApplicationWebACL:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub '${AppName}-web-acl'
+      Scope: REGIONAL
+      DefaultAction:
+        Allow: {}
+      VisibilityConfig:
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub '${AppName}-web-acl'
+        SampledRequestsEnabled: true
+      Rules:
+        - Name: AWSManagedCommonRules
+          Priority: 10
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+          VisibilityConfig:
+            CloudWatchMetricsEnabled: true
+            MetricName: AWSManagedCommonRules
+            SampledRequestsEnabled: true
+        - Name: RateLimit
+          Priority: 20
+          Action:
+            Block: {}
+          Statement:
+            RateBasedStatement:
+              Limit: 2000
+              AggregateKeyType: IP
+          VisibilityConfig:
+            CloudWatchMetricsEnabled: true
+            MetricName: RateLimit
+            SampledRequestsEnabled: true
+  WebACLAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    Properties:
+      WebACLArn: !GetAtt ApplicationWebACL.Arn
+      ResourceArn: !Ref ApplicationLoadBalancer
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: ReadDatabaseCredentials
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !GetAtt Database.MasterUserSecret.SecretArn
+      Tags:
+        - Key: Name
+          Value: !Sub '${AppName}-ec2-role'
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref InstanceRole
+  ApplicationLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${AppName}-launch-template'
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref AppInstanceType
+        IamInstanceProfile:
+          Arn: !GetAtt InstanceProfile.Arn
+        SecurityGroupIds:
+          - !GetAtt AppSecurityGroup.GroupId
+        MetadataOptions:
+          HttpEndpoint: enabled
+          HttpTokens: required
+          HttpPutResponseHopLimit: 1
+        Monitoring:
+          Enabled: true
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: 12
+              VolumeType: gp3
+              Encrypted: true
+              DeleteOnTermination: true
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -euxo pipefail
+            dnf install -y python3 python3-pip
+            install -d -o ec2-user -g ec2-user /opt/scalelab
+            APP_PAYLOAD='IiIiU21hbGwgc3RhdGVsZXNzIHN0b3JlZnJvbnQgdXNlZCB0byBkZW1vbnN0cmF0ZSB0aGUgQVdTIGFyY2hpdGVjdHVyZS4iIiIKCmZyb20gX19mdXR1cmVfXyBpbXBvcnQgYW5ub3RhdGlvbnMKCmltcG9ydCBqc29uCmltcG9ydCBvcwppbXBvcnQgc29ja2V0CmZyb20gZnVuY3Rvb2xzIGltcG9ydCBscnVfY2FjaGUKCmltcG9ydCBib3RvMwppbXBvcnQgcHlteXNxbApmcm9tIGZsYXNrIGltcG9ydCBGbGFzaywgUmVzcG9uc2UKCmFwcCA9IEZsYXNrKF9fbmFtZV9fKQpSRUdJT04gPSBvcy5nZXRlbnYoIkFXU19SRUdJT04iLCAidXMtZWFzdC0xIikKU0VDUkVUX0FSTiA9IG9zLmVudmlyb25bIkRCX1NFQ1JFVF9BUk4iXQpEQl9IT1NUID0gb3MuZW52aXJvblsiREJfSE9TVCJdCkRCX05BTUUgPSBvcy5nZXRlbnYoIkRCX05BTUUiLCAiYXBwZGIiKQpTVEFUSUNfVVJMID0gb3MuZ2V0ZW52KCJTVEFUSUNfQVNTRVRTX1VSTCIsICIiKS5yc3RyaXAoIi8iKQoKCkBscnVfY2FjaGUobWF4c2l6ZT0xKQpkZWYgZGF0YWJhc2VfY3JlZGVudGlhbHMoKSAtPiBkaWN0W3N0ciwgc3RyXToKICAgIHJlc3BvbnNlID0gYm90bzMuY2xpZW50KCJzZWNyZXRzbWFuYWdlciIsIHJlZ2lvbl9uYW1lPVJFR0lPTikuZ2V0X3NlY3JldF92YWx1ZSgKICAgICAgICBTZWNyZXRJZD1TRUNSRVRfQVJOCiAgICApCiAgICByZXR1cm4ganNvbi5sb2FkcyhyZXNwb25zZVsiU2VjcmV0U3RyaW5nIl0pCgoKZGVmIGRhdGFiYXNlX2Nvbm5lY3Rpb24oKToKICAgIGNyZWRlbnRpYWxzID0gZGF0YWJhc2VfY3JlZGVudGlhbHMoKQogICAgcmV0dXJuIHB5bXlzcWwuY29ubmVjdCgKICAgICAgICBob3N0PURCX0hPU1QsCiAgICAgICAgdXNlcj1jcmVkZW50aWFsc1sidXNlcm5hbWUiXSwKICAgICAgICBwYXNzd29yZD1jcmVkZW50aWFsc1sicGFzc3dvcmQiXSwKICAgICAgICBkYXRhYmFzZT1EQl9OQU1FLAogICAgICAgIGNvbm5lY3RfdGltZW91dD0zLAogICAgICAgIHJlYWRfdGltZW91dD0zLAogICAgICAgIHdyaXRlX3RpbWVvdXQ9MywKICAgICAgICBhdXRvY29tbWl0PVRydWUsCiAgICApCgoKZGVmIHBhZ2VfY291bnQoKSAtPiBpbnQ6CiAgICB3aXRoIGRhdGFiYXNlX2Nvbm5lY3Rpb24oKSBhcyBjb25uZWN0aW9uOgogICAgICAgIHdpdGggY29ubmVjdGlvbi5jdXJzb3IoKSBhcyBjdXJzb3I6CiAgICAgICAgICAgIGN1cnNvci5leGVjdXRlKAogICAgICAgICAgICAgICAgIkNSRUFURSBUQUJMRSBJRiBOT1QgRVhJU1RTIHBhZ2VfY291bnRlciAiCiAgICAgICAgICAgICAgICAiKGNvdW50ZXJfbmFtZSBWQVJDSEFSKDMyKSBQUklNQVJZIEtFWSwgdmlzaXRzIEJJR0lOVCBOT1QgTlVMTCkiCiAgICAgICAgICAgICkKICAgICAgICAgICAgY3Vyc29yLmV4ZWN1dGUoCiAgICAgICAgICAgICAgICAiSU5TRVJUIElOVE8gcGFnZV9jb3VudGVyIChjb3VudGVyX25hbWUsIHZpc2l0cykgVkFMVUVTICgnaG9tZScsIDEpICIKICAgICAgICAgICAgICAgICJPTiBEVVBMSUNBVEUgS0VZIFVQREFURSB2aXNpdHMgPSB2aXNpdHMgKyAxIgogICAgICAgICAgICApCiAgICAgICAgICAgIGN1cnNvci5leGVjdXRlKAogICAgICAgICAgICAgICAgIlNFTEVDVCB2aXNpdHMgRlJPTSBwYWdlX2NvdW50ZXIgV0hFUkUgY291bnRlcl9uYW1lID0gJ2hvbWUnIgogICAgICAgICAgICApCiAgICAgICAgICAgIHJldHVybiBpbnQoY3Vyc29yLmZldGNob25lKClbMF0pCgoKQGFwcC5nZXQoIi9oZWFsdGh6IikKZGVmIGhlYWx0aHooKSAtPiBSZXNwb25zZToKICAgIHJldHVybiBSZXNwb25zZSgib2tcbiIsIHN0YXR1cz0yMDAsIG1pbWV0eXBlPSJ0ZXh0L3BsYWluIikKCgpAYXBwLmdldCgiLyIpCmRlZiBob21lKCkgLT4gUmVzcG9uc2U6CiAgICB0cnk6CiAgICAgICAgdmlzaXRzID0gcGFnZV9jb3VudCgpCiAgICAgICAgZGJfbWVzc2FnZSA9IGYiRGF0YWJhc2UgY29ubmVjdGVkIMK3IHt2aXNpdHM6LH0gcGFnZSB2aWV3cyIKICAgICAgICBkYl9jbGFzcyA9ICJoZWFsdGh5IgogICAgICAgIHN0YXR1cyA9IDIwMAogICAgZXhjZXB0IEV4Y2VwdGlvbiBhcyBleGM6ICAjIEtlZXAgdGhlIGZhaWx1cmUgdmlzaWJsZSB0byBhIGxlYXJuZXIgd2l0aG91dCBsZWFraW5nIHNlY3JldHMuCiAgICAgICAgYXBwLmxvZ2dlci5leGNlcHRpb24oIkRhdGFiYXNlIHJlcXVlc3QgZmFpbGVkIikKICAgICAgICBkYl9tZXNzYWdlID0gZiJEYXRhYmFzZSB0ZW1wb3JhcmlseSB1bmF2YWlsYWJsZSAoe3R5cGUoZXhjKS5fX25hbWVfX30pIgogICAgICAgIGRiX2NsYXNzID0gImRlZ3JhZGVkIgogICAgICAgIHN0YXR1cyA9IDUwMwoKICAgIGNzcyA9IGYie1NUQVRJQ19VUkx9L3NpdGUuY3NzIiBpZiBTVEFUSUNfVVJMIGVsc2UgIi9zaXRlLmNzcyIKICAgIGJvZHkgPSBmIiIiPCFkb2N0eXBlIGh0bWw+CjxodG1sIGxhbmc9ImVuIj4KICA8aGVhZD4KICAgIDxtZXRhIGNoYXJzZXQ9InV0Zi04Ij4KICAgIDxtZXRhIG5hbWU9InZpZXdwb3J0IiBjb250ZW50PSJ3aWR0aD1kZXZpY2Utd2lkdGgsIGluaXRpYWwtc2NhbGU9MSI+CiAgICA8dGl0bGU+U2NhbGVMYWIgfCBBV1MgcmVmZXJlbmNlIGFwcDwvdGl0bGU+CiAgICA8bGluayByZWw9InN0eWxlc2hlZXQiIGhyZWY9Intjc3N9Ij4KICA8L2hlYWQ+CiAgPGJvZHk+CiAgICA8bWFpbiBjbGFzcz0ic2hlbGwiPgogICAgICA8ZGl2IGNsYXNzPSJleWVicm93Ij48c3BhbiBjbGFzcz0icHVsc2UiPjwvc3Bhbj4gQVdTIFNPTFVUSU9OUyBBUkNISVRFQ1QgQVNTT0NJQVRFPC9kaXY+CiAgICAgIDxoMT5TY2FsZUxhYjwvaDE+CiAgICAgIDxwIGNsYXNzPSJsZWRlIj5BIHNtYWxsLCBzdGF0ZWxlc3Mgd2ViIGFwcCBiZWhpbmQgYSBtdWx0aS1BWiBsb2FkIGJhbGFuY2VyLjwvcD4KICAgICAgPHNlY3Rpb24gY2xhc3M9InN0YXR1cy1jYXJkIj4KICAgICAgICA8ZGl2IGNsYXNzPSJzdGF0dXMtaWNvbiI+4pyTPC9kaXY+CiAgICAgICAgPGRpdj48cCBjbGFzcz0ibGFiZWwiPkxJVkUgU1RBVFVTPC9wPjxwIGNsYXNzPSJzdGF0dXMge2RiX2NsYXNzfSI+e2RiX21lc3NhZ2V9PC9wPjwvZGl2PgogICAgICA8L3NlY3Rpb24+CiAgICAgIDxkaXYgY2xhc3M9ImRldGFpbHMiPgogICAgICAgIDxkaXY+PHNwYW4+U2VydmVkIGJ5PC9zcGFuPjxzdHJvbmc+e3NvY2tldC5nZXRob3N0bmFtZSgpfTwvc3Ryb25nPjwvZGl2PgogICAgICAgIDxkaXY+PHNwYW4+RGF0YSBsYXllcjwvc3Bhbj48c3Ryb25nPkFtYXpvbiBSRFMgwrcgTXVsdGktQVo8L3N0cm9uZz48L2Rpdj4KICAgICAgICA8ZGl2PjxzcGFuPkNvbXB1dGU8L3NwYW4+PHN0cm9uZz5FQzIgQXV0byBTY2FsaW5nPC9zdHJvbmc+PC9kaXY+CiAgICAgIDwvZGl2PgogICAgICA8Zm9vdGVyPkRlc2lnbmVkIGZvciBhdmFpbGFiaWxpdHksIHNlY3VyZSBvcGVyYXRpb25zLCBhbmQgbWVhc3VyZWQgc2NhbGUuPC9mb290ZXI+CiAgICA8L21haW4+CiAgPC9ib2R5Pgo8L2h0bWw+IiIiCiAgICByZXR1cm4gUmVzcG9uc2UoYm9keSwgc3RhdHVzPXN0YXR1cywgbWltZXR5cGU9InRleHQvaHRtbCIpCgoKaWYgX19uYW1lX18gPT0gIl9fbWFpbl9fIjoKICAgIGFwcC5ydW4oaG9zdD0iMC4wLjAuMCIsIHBvcnQ9ODA4MCkK'
+            printf '%s' "$APP_PAYLOAD" | base64 -d > /opt/scalelab/app.py
+            chown ec2-user:ec2-user /opt/scalelab/app.py
+            python3 -m venv /opt/scalelab/venv
+            /opt/scalelab/venv/bin/pip install --upgrade pip
+            /opt/scalelab/venv/bin/pip install 'Flask>=3.0,<4' 'gunicorn>=22,<24' 'PyMySQL>=1.1,<2' 'boto3>=1.34,<2'
+            cat > /etc/systemd/system/scalelab.service <<'UNIT'
+            [Unit]
+            Description=ScaleLab reference web application
+            After=network-online.target
+            Wants=network-online.target
+            [Service]
+            User=ec2-user
+            Group=ec2-user
+            WorkingDirectory=/opt/scalelab
+            Environment=AWS_REGION=${AWS::Region}
+            Environment=DB_HOST=${Database.Endpoint.Address}
+            Environment=DB_NAME=appdb
+            Environment=DB_SECRET_ARN=${Database.MasterUserSecret.SecretArn}
+            Environment=STATIC_ASSETS_URL=https://${StaticAssetsDistribution.DomainName}
+            ExecStart=/opt/scalelab/venv/bin/gunicorn --workers 2 --bind 0.0.0.0:8080 app:app
+            Restart=always
+            RestartSec=3
+            NoNewPrivileges=true
+            ProtectSystem=full
+            ProtectHome=true
+            PrivateTmp=true
+            [Install]
+            WantedBy=multi-user.target
+            UNIT
+            systemctl daemon-reload
+            systemctl enable --now scalelab.service
+
+  ApplicationAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn:
+      - HttpListener
+      - AppDefaultRouteA
+      - AppDefaultRouteB
+    Properties:
+      AutoScalingGroupName: !Sub '${AppName}-asg'
+      VPCZoneIdentifier:
+        - !Ref AppSubnetA
+        - !Ref AppSubnetB
+      LaunchTemplate:
+        LaunchTemplateId: !Ref ApplicationLaunchTemplate
+        Version: !GetAtt ApplicationLaunchTemplate.LatestVersionNumber
+      MinSize: !Ref MinCapacity
+      DesiredCapacity: !Ref DesiredCapacity
+      MaxSize: !Ref MaxCapacity
+      TargetGroupARNs:
+        - !Ref ApplicationTargetGroup
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 600
+      DefaultInstanceWarmup: 180
+      MetricsCollection:
+        - Granularity: 1Minute
+      Tags:
+        - Key: Name
+          Value: !Sub '${AppName}-web'
+          PropagateAtLaunch: true
+  CpuTargetTrackingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref ApplicationAutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: 50
+        DisableScaleIn: false
+      EstimatedInstanceWarmup: 180
+  RequestBurstStepScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref ApplicationAutoScalingGroup
+      PolicyType: StepScaling
+      AdjustmentType: ChangeInCapacity
+      MetricAggregationType: Average
+      Cooldown: 180
+      StepAdjustments:
+        - MetricIntervalLowerBound: 0
+          ScalingAdjustment: 1
+
+  DatabaseSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Private database subnets across two Availability Zones.
+      SubnetIds:
+        - !Ref DatabaseSubnetA
+        - !Ref DatabaseSubnetB
+      Tags:
+        - Key: Name
+          Value: !Sub '${AppName}-database-subnets'
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DBInstanceIdentifier: !Sub '${AppName}-db'
+      Engine: mysql
+      DBInstanceClass: !Ref DatabaseInstanceClass
+      AllocatedStorage: 20
+      MaxAllocatedStorage: 100
+      StorageType: gp3
+      StorageEncrypted: true
+      PubliclyAccessible: false
+      MultiAZ: true
+      BackupRetentionPeriod: 7
+      AutoMinorVersionUpgrade: true
+      ManageMasterUserPassword: true
+      MasterUsername: scalelab_admin
+      DBName: appdb
+      DBSubnetGroupName: !Ref DatabaseSubnetGroup
+      VPCSecurityGroups:
+        - !GetAtt DatabaseSecurityGroup.GroupId
+      DeletionProtection: false
+      CopyTagsToSnapshot: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AppName}-db'
+
+  StaticAssetsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      Tags:
+        - Key: Name
+          Value: !Sub '${AppName}-static-assets'
+  StaticAssetsOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${AppName}-static-oac'
+        Description: CloudFront-only access to the private static asset bucket.
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+  StaticAssetsDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub '${AppName} static asset CDN'
+        PriceClass: PriceClass_100
+        HttpVersion: http2and3
+        Origins:
+          - Id: static-assets-s3
+            DomainName: !GetAtt StaticAssetsBucket.RegionalDomainName
+            OriginAccessControlId: !Ref StaticAssetsOriginAccessControl
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+        DefaultCacheBehavior:
+          TargetOriginId: static-assets-s3
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AppName}-static-cdn'
+  StaticAssetsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref StaticAssetsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontReadOnly
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${StaticAssetsBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${StaticAssetsDistribution}'
+
+  ApplicationAlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AppName}-alarms'
+      DisplayName: !Sub '${AppName} CloudWatch alerts'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AppName}-alarms'
+  HighAsgCpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Average Auto Scaling group CPU exceeds 75% for 10 minutes.
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref ApplicationAutoScalingGroup
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 2
+      Threshold: 75
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref ApplicationAlarmTopic
+  AlbTarget5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Application targets return repeated 5xx responses.
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_Target_5XX_Count
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !GetAtt ApplicationLoadBalancer.LoadBalancerFullName
+        - Name: TargetGroup
+          Value: !GetAtt ApplicationTargetGroup.TargetGroupFullName
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref ApplicationAlarmTopic
+  RequestBurstAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Add one EC2 instance when per-target request volume stays high for three minutes.
+      Namespace: AWS/ApplicationELB
+      MetricName: RequestCountPerTarget
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !GetAtt ApplicationLoadBalancer.LoadBalancerFullName
+        - Name: TargetGroup
+          Value: !GetAtt ApplicationTargetGroup.TargetGroupFullName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 3
+      Threshold: 300
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref ApplicationAlarmTopic
+        - !Ref RequestBurstStepScalingPolicy
+  DatabaseCpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: RDS CPU exceeds 75% for 10 minutes.
+      Namespace: AWS/RDS
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref Database
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 2
+      Threshold: 75
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref ApplicationAlarmTopic
+  ApplicationDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${AppName}-overview'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {"type":"metric","x":0,"y":0,"width":12,"height":6,"properties":{"title":"EC2 Auto Scaling CPU","view":"timeSeries","region":"${AWS::Region}","period":300,"metrics":[["AWS/EC2","CPUUtilization","AutoScalingGroupName","${ApplicationAutoScalingGroup}",{"stat":"Average"}]]}},
+            {"type":"metric","x":12,"y":0,"width":12,"height":6,"properties":{"title":"ALB request count and target latency","view":"timeSeries","region":"${AWS::Region}","period":300,"metrics":[["AWS/ApplicationELB","RequestCount","LoadBalancer","${ApplicationLoadBalancer.LoadBalancerFullName}",{"stat":"Sum"}],[".","TargetResponseTime","LoadBalancer","${ApplicationLoadBalancer.LoadBalancerFullName}","TargetGroup","${ApplicationTargetGroup.TargetGroupFullName}",{"stat":"Average","yAxis":"right"}]]}},
+            {"type":"metric","x":0,"y":6,"width":12,"height":6,"properties":{"title":"RDS CPU","view":"timeSeries","region":"${AWS::Region}","period":300,"metrics":[["AWS/RDS","CPUUtilization","DBInstanceIdentifier","${Database}",{"stat":"Average"}]]}},
+            {"type":"metric","x":12,"y":6,"width":12,"height":6,"properties":{"title":"ALB target 5xx responses","view":"timeSeries","region":"${AWS::Region}","period":300,"metrics":[["AWS/ApplicationELB","HTTPCode_Target_5XX_Count","LoadBalancer","${ApplicationLoadBalancer.LoadBalancerFullName}","TargetGroup","${ApplicationTargetGroup.TargetGroupFullName}",{"stat":"Sum"}]]}}
+          ]
+        }
+
+  Route53HealthCheck:
+    Type: AWS::Route53::HealthCheck
+    Condition: HasDomain
+    Properties:
+      HealthCheckConfig:
+        Type: HTTP
+        FullyQualifiedDomainName: !GetAtt ApplicationLoadBalancer.DNSName
+        Port: 80
+        ResourcePath: /healthz
+        RequestInterval: 30
+        FailureThreshold: 3
+        EnableSNI: false
+        MeasureLatency: true
+      HealthCheckTags:
+        - Key: Name
+          Value: !Sub '${AppName}-alb-health'
+  AppDNSRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: HasDomain
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt ApplicationLoadBalancer.DNSName
+        HostedZoneId: !GetAtt ApplicationLoadBalancer.CanonicalHostedZoneID
+        EvaluateTargetHealth: true
+      HealthCheckId: !Ref Route53HealthCheck
+
+Outputs:
+  ApplicationURL:
+    Description: Main application URL (HTTP unless an ACM certificate was supplied).
+    Value: !If
+      - HasCertificate
+      - !If
+        - HasDomain
+        - !Sub 'https://${DomainName}'
+        - !Sub 'https://${ApplicationLoadBalancer.DNSName}'
+      - !If
+        - HasDomain
+        - !Sub 'http://${DomainName}'
+        - !Sub 'http://${ApplicationLoadBalancer.DNSName}'
+  LoadBalancerDNSName:
+    Description: ALB endpoint; Route 53 alias points here when DomainName is supplied.
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+  StaticAssetsURL:
+    Description: CloudFront URL for static assets (append /site.css).
+    Value: !Sub 'https://${StaticAssetsDistribution.DomainName}'
+  StaticAssetsBucketName:
+    Description: Private S3 bucket populated by scripts/deploy.ps1.
+    Value: !Ref StaticAssetsBucket
+  CloudFrontDistributionId:
+    Description: CloudFront distribution ID used by the deployment script.
+    Value: !Ref StaticAssetsDistribution
+  AutoScalingGroupName:
+    Value: !Ref ApplicationAutoScalingGroup
+  DatabaseEndpoint:
+    Value: !GetAtt Database.Endpoint.Address
+  AlarmTopicArn:
+    Value: !Ref ApplicationAlarmTopic
+  DashboardName:
+    Value: !Ref ApplicationDashboard
+  VpcId:
+    Value: !Ref VPC

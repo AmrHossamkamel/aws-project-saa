@@ -1,0 +1,38 @@
+:root {
+  color-scheme: light;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: #192b3b;
+  background: #f4f7fb;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 32px 20px;
+  background: radial-gradient(circle at 80% 12%, #e6f4ff 0, transparent 29rem), #f4f7fb;
+}
+
+.shell { width: min(100%, 760px); }
+.eyebrow { color: #536b80; font-size: 11px; font-weight: 800; letter-spacing: .15em; }
+.pulse { display: inline-block; width: 8px; height: 8px; margin-right: 8px; border-radius: 50%; background: #20a879; box-shadow: 0 0 0 4px #d8f3e9; }
+h1 { margin: 18px 0 8px; font-size: clamp(44px, 8vw, 76px); line-height: .98; letter-spacing: -.07em; color: #102a43; }
+.lede { margin: 0; color: #63788c; font-size: 18px; line-height: 1.55; }
+.status-card { display: flex; align-items: center; gap: 16px; margin-top: 38px; padding: 22px 24px; border: 1px solid #d8e3ed; border-radius: 18px; background: #fff; box-shadow: 0 14px 38px #193b5510; }
+.status-icon { display: grid; width: 42px; height: 42px; place-items: center; border-radius: 14px; background: #e5f7ef; color: #14845d; font-size: 22px; font-weight: 800; }
+.label { margin: 0 0 5px; color: #8294a4; font-size: 10px; font-weight: 800; letter-spacing: .13em; }
+.status { margin: 0; font-size: 15px; font-weight: 650; }
+.healthy { color: #14845d; }.degraded { color: #a5521b; }
+.details { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-top: 18px; }
+.details div { padding: 18px; border: 1px solid #e0e8ef; border-radius: 14px; background: #ffffffa8; }
+.details span, .details strong { display: block; }
+.details span { margin-bottom: 8px; color: #8495a4; font-size: 12px; }
+.details strong { color: #29455d; font-size: 13px; }
+footer { margin-top: 28px; color: #8595a3; font-size: 12px; }
+
+@media (max-width: 600px) { .details { grid-template-columns: 1fr; } .status-card { align-items: flex-start; } }
